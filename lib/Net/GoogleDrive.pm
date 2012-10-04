@@ -25,19 +25,29 @@ Google Drive API is basd on OAuth. I try to abstract as much away as
 possible so you should not need to know too much about it.  Kudos to
 Net::Dropbox::API.
 
+You must register with google, then request access to the google drive
+api here: https://developers.google.com/drive/quickstart#enable_the_drive_api
+
 This is how it works:
 
     use Net::GoogleDrive;
 
-    my $gdrive = Net::GoogleDrive->new();
+    my %args = (
+        scope         => 'https://www.googleapis.com/auth/drive',
+        redirect_uri  => 'urn:ietf:wg:oauth:2.0:oob',
+        client_id     => '<provided by google>',
+        client_secret => '<provided by google>',
+    );
+
+    my $gdrive = Net::GoogleDrive->new(%args);
     my $login_link = $gdrive->login_link();
 
     ... Time passes and the login link is clicked ...
 
-    my $gdrive = Net::GoogleDrive->new();
+    my $gdrive = Net::GoogleDrive->new(%args);
 
-    # $code will come from CGI or somesuch: Google gives it to you
-    $gdrive->token($code);
+    # $auth_token will come from CGI or somesuch: Google gives it to you
+    $gdrive->token($auth_token);
 
     my $files = $gdrive->files();
 
@@ -48,6 +58,13 @@ This is how it works:
             close($fh);
         }
     }
+
+Once you have the $auth_token, internally an $access_token will be retrieved
+and stored.  If you want continued access to the google drive api over
+multiple instances of your program or multiple CGI requests, you must store
+access token and pass it in each time (otherwise you will be forced to
+constantly log in and generate more auth tokens).  You can pass in an existing
+access token using the access_token() method.
 
 =head1 FUNCTIONS
 
@@ -153,6 +170,146 @@ sub files
         warn "Something went wrong: ".$res->status_line();
         return(undef);
     }
+}
+
+=head2 uploadSimple
+
+This does a simple upload.  This method does one request to the google drive
+api with the metadata, then a subsequent request to the google upload service
+with the file content.  According to the google drive api documentation, this
+should only be used on smaller files that don't need to resume if the transfer
+fails (they can just be completely re-uploaded).
+
+File metadata must be provided in a datastructure matching the documentation
+here:
+
+https://developers.google.com/drive/v2/reference/files/insert
+
+In addition, provide a "data" key that contains the file content itself.  If
+you have a file on the filesystem and you don't want to read it yourself
+before uploading, try uploadMultipart().
+
+ $gdrive->uploadSimple($file_ref);
+
+Arguments:
+    $file_ref - A datastructure (hashref) that holds file metadata (plus an
+                extra "data" key that holds the file content)
+
+=cut
+
+sub uploadSimple
+{
+    my $self = shift;
+    my $file_ref = shift;
+
+    # The actual content of the file gets uploaded in a separate request
+    my $data = delete $file_ref->{'data'};
+
+    my $req = HTTP::Request->new(
+        POST => 'https://www.googleapis.com/drive/v2/files',
+        HTTP::Headers->new(
+            'Authorization' => 'Bearer ' . $self->access_token(),
+            'Content-Type'  => 'application/json',
+        ),
+    );
+
+    $req->content(JSON::to_json($file_ref, { pretty => 1 }));
+
+    my $res = $self->ua()->request($req);
+
+    if(!$res->is_success()) {
+        $self->error($res->status_line());
+        warn "Something went wrong: " . $res->status_line();
+        warn $res->content();
+        return undef;
+    }
+
+    my $response = JSON::from_json($res->content());
+
+    my $id = $response->{'id'};
+
+    my $put_req = HTTP::Request->new(
+        PUT => "https://www.googleapis.com/upload/drive/v2/files/$id?uploadType=media",
+        HTTP::Headers->new(
+            'Authorization' => 'Bearer ' . $self->access_token(),
+            'Content-Type'  => $file_ref->{'mimeType'},
+        ),
+    );
+
+    $put_req->content($data);
+
+    my $put_response = $self->ua()->request($put_req);
+
+    if(!$put_response->is_success()) {
+        $self->error($put_response->status_line());
+        warn "Something went wrong: " . $put_response->status_line();
+        warn $put_response->content();
+        return undef;
+    }
+
+    return JSON::from_json($put_response->content());
+}
+
+=head2 uploadMultipart
+
+This does an upload with a multi-part post request.  This will be a single 
+request and according to the google drive api documentation, should only be 
+used on smaller files that don't need to resume if the transfer fails (they 
+can just be completely re-uploaded).
+
+File metadata must be provided in a datastructure matching the documentation
+here:
+
+https://developers.google.com/drive/v2/reference/files/insert
+
+ $gdrive->uploadMultipart($file, $file_ref);
+
+Arguments:
+    $file - a path to a file on the filesystem
+    $file_ref - A datastructure (hashref) that holds file metadata
+
+=cut
+
+sub uploadMultipart {
+    my ($self, $file, $file_ref) = @_;
+
+    # This function call is all sorts of weird.  See 
+    # https://developers.google.com/drive/manage-uploads#multipart for more 
+    # information on what the request should look like.  The Content key passed 
+    # to POST is an arrayref to trigger multipart, and each part is unamed ('' 
+    # for key), and each value is an arrayref to indicate to POST() that these 
+    # are file uploads, NOT regular form data.  By default, POST() attempts to 
+    # read the file from the fs, but we disallow that behavior in the json part 
+    # since we have it in memory.
+    my $req = HTTP::Request::Common::POST(
+        'https://www.googleapis.com/upload/drive/v2/files?uploadType=multipart',
+        Authorization => 'Bearer ' . $self->access_token(),
+        Content_Type  => 'form-data',
+        Content => [
+            '' => [
+                undef, # do not attempt to read this part from the fs
+                '',    # no filename, it's a json part
+                Content_Type => 'application/json',
+                Content => JSON::to_json($file_ref, { pretty => 1 }),
+            ],
+            '' => [
+                $file,                # POST() will read file from fs
+                $file_ref->{'title'}, # Use the title as the filename
+                Content_Type => $file_ref->{'mimeType'},
+            ]
+        ],
+    );
+
+    my $res = $self->ua()->request($req);
+
+    if(!$res->is_success()) {
+        $self->error($res->status_line());
+        warn "Something went wrong: " . $res->status_line();
+        warn $res->content();
+        return undef;
+    }
+
+    return JSON::from_json($res->content());
 }
 
 =head2 downloadUrl
